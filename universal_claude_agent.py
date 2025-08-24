@@ -29,6 +29,9 @@ class ULCAgent:
         self.project_dir = Path(project_dir).resolve()
         self.context_file = self.project_dir / PROJECT_CONTEXT_FILE
         self.context = self._load_or_create_context()
+        self.confirmation_mode = False
+        self.pending_action = None
+        self.pending_question = None
         
     def _load_or_create_context(self) -> Dict[str, Any]:
         """Load existing context or create new one"""
@@ -311,11 +314,12 @@ FORMAT YOUR RESPONSE CLEARLY AND STRUCTURED. Always end with a clear question or
             print(f"❌ Error deleting file {file_path}: {e}")
             return False
     
-    def _parse_llm_response(self, response: str) -> Tuple[str, List[str], List[str]]:
-        """Parse LLM response for actions and TODO items"""
-        # Simple parsing - in production, you might want more sophisticated parsing
+    def _parse_llm_response(self, response: str) -> Tuple[str, List[str], List[str], bool, str]:
+        """Parse LLM response for actions, TODO items, and confirmation requests"""
         actions = []
         todo_items = []
+        needs_confirmation = False
+        confirmation_question = ""
         
         # Look for TODO items (lines starting with - or * or numbered)
         lines = response.split('\n')
@@ -325,7 +329,28 @@ FORMAT YOUR RESPONSE CLEARLY AND STRUCTURED. Always end with a clear question or
                 if 'todo' in line.lower() or 'task' in line.lower():
                     todo_items.append(line)
         
-        return response, actions, todo_items
+        # Detect confirmation requests
+        response_lower = response.lower()
+        confirmation_indicators = [
+            'should i proceed', 'shall i proceed', 'do you want me to',
+            'would you like me to', 'can i proceed', 'may i proceed',
+            'do you approve', 'should i continue', 'shall i continue',
+            'do you want me to continue', 'would you like me to continue'
+        ]
+        
+        for indicator in confirmation_indicators:
+            if indicator in response_lower:
+                needs_confirmation = True
+                # Extract the question around the confirmation request
+                start_idx = response_lower.find(indicator)
+                if start_idx != -1:
+                    # Get context around the confirmation request
+                    context_start = max(0, start_idx - 100)
+                    context_end = min(len(response), start_idx + 200)
+                    confirmation_question = response[context_start:context_end].strip()
+                    break
+        
+        return response, actions, todo_items, needs_confirmation, confirmation_question
     
     def _update_todo_list(self, new_items: List[str]):
         """Update TODO list with new items"""
@@ -358,12 +383,24 @@ FORMAT YOUR RESPONSE CLEARLY AND STRUCTURED. Always end with a clear question or
             return "I'm sorry, but I encountered an error communicating with my local Claude model. Please check that the model is running and accessible."
         
         # Parse response
-        parsed_response, actions, todo_items = self._parse_llm_response(llm_response)
+        parsed_response, actions, todo_items, needs_confirmation, confirmation_question = self._parse_llm_response(llm_response)
         
         # Update TODO list if new items found
         if todo_items:
             self._update_todo_list(todo_items)
             print(f"📝 Updated TODO list with {len(todo_items)} new items")
+        
+        # Check if LLM is asking for confirmation
+        if needs_confirmation:
+            self.confirmation_mode = True
+            self.pending_action = "llm_confirmation"
+            self.pending_question = confirmation_question
+            print(f"\n🔒 CONFIRMATION REQUIRED:")
+            print(f"🤖 Claude is asking for your approval:")
+            print(f"   {confirmation_question}")
+            print(f"\n💬 Please respond with 'yes' or 'no' to continue.")
+            print(f"💡 You can also type 'exit' to cancel or 'clear' to reset.")
+            return "AWAITING_CONFIRMATION"
         
         # Update context
         self._update_context(user_input, parsed_response)
@@ -385,7 +422,13 @@ FORMAT YOUR RESPONSE CLEARLY AND STRUCTURED. Always end with a clear question or
         
         while True:
             try:
-                user_input = input("\n🎯 You: ").strip()
+                # Show confirmation mode indicator
+                if self.confirmation_mode:
+                    prompt = "\n🔒 CONFIRMATION REQUIRED (yes/no): "
+                else:
+                    prompt = "\n🎯 You: "
+                
+                user_input = input(prompt).strip()
                 
                 if not user_input:
                     continue
@@ -418,8 +461,35 @@ FORMAT YOUR RESPONSE CLEARLY AND STRUCTURED. Always end with a clear question or
                     self._show_files()
                     continue
                 
+                if user_input.lower() == 'confirm':
+                    if self.confirmation_mode:
+                        print(f"🔒 Currently awaiting confirmation for: {self.pending_question}")
+                    else:
+                        print("✅ No confirmation pending - agent is ready for new commands")
+                    continue
+                
+                if user_input.lower() == 'clear':
+                    if self.confirmation_mode:
+                        print("🧹 Clearing confirmation mode")
+                        self.confirmation_mode = False
+                        self.pending_action = None
+                        self.pending_question = None
+                    else:
+                        print("✅ No confirmation mode to clear")
+                    continue
+                
+                # Check if we're in confirmation mode
+                if self.confirmation_mode:
+                    response = self._handle_confirmation_response(user_input)
+                    print(f"\n🤖 Claude: {response}")
+                    continue
+                
                 # Process user input
                 response = self.process_user_input(user_input)
+                
+                if response == "AWAITING_CONFIRMATION":
+                    # Don't print response, we're waiting for confirmation
+                    continue
                 
                 print(f"\n🤖 Claude: {response}")
                 
@@ -441,6 +511,8 @@ FORMAT YOUR RESPONSE CLEARLY AND STRUCTURED. Always end with a clear question or
 - todo: Show current TODO list
 - files: Show current directory contents
 - test: Test LLM connection
+- confirm: Show confirmation status
+- clear: Clear confirmation mode
 - exit/quit/q: Exit the program
 
 💡 Usage Tips:
@@ -453,6 +525,7 @@ FORMAT YOUR RESPONSE CLEARLY AND STRUCTURED. Always end with a clear question or
     
     def _show_status(self):
         """Show current project status"""
+        confirmation_status = "🔒 AWAITING CONFIRMATION" if self.confirmation_mode else "✅ Ready"
         status_text = f"""
 📊 Project Status:
 - Directory: {self.project_dir}
@@ -461,6 +534,7 @@ FORMAT YOUR RESPONSE CLEARLY AND STRUCTURED. Always end with a clear question or
 - TODO Items: {len(self.context.get('todo_list', []))}
 - Conversations: {len(self.context.get('conversation_history', []))}
 - Last Updated: {self.context.get('last_updated', 'Unknown')}
+- Agent State: {confirmation_status}
         """
         print(status_text)
     
@@ -493,6 +567,49 @@ FORMAT YOUR RESPONSE CLEARLY AND STRUCTURED. Always end with a clear question or
                 print(f"🤖 Response: {response}")
         except Exception as e:
             print(f"❌ Test failed with error: {e}")
+    
+    def _handle_confirmation_response(self, user_input: str) -> str:
+        """Handle user confirmation responses"""
+        if not self.confirmation_mode:
+            return "No confirmation pending"
+        
+        user_input_lower = user_input.lower().strip()
+        
+        if user_input_lower in ['yes', 'y', 'proceed', 'continue', 'approve']:
+            # User approved the action
+            print(f"✅ Confirmation received: PROCEEDING with action")
+            self.confirmation_mode = False
+            self.pending_action = None
+            self.pending_question = None
+            
+            # Send the confirmation back to LLM to continue
+            follow_up_prompt = f"User has confirmed: '{user_input}'. Please proceed with the action you were planning."
+            try:
+                return self._call_llm(follow_up_prompt)
+            except Exception as e:
+                return f"Error continuing with action: {e}. Please provide a new instruction."
+            
+        elif user_input_lower in ['no', 'n', 'cancel', 'stop', 'deny']:
+            # User denied the action
+            print(f"❌ Confirmation received: CANCELLING action")
+            self.confirmation_mode = False
+            self.pending_action = None
+            self.pending_question = None
+            
+            return "Action cancelled by user. What would you like to do instead?"
+            
+        elif user_input_lower in ['exit', 'quit', 'q']:
+            # User wants to exit confirmation mode
+            print(f"🚪 Exiting confirmation mode")
+            self.confirmation_mode = False
+            self.pending_action = None
+            self.pending_question = None
+            
+            return "Confirmation mode exited. What would you like to do?"
+            
+        else:
+            # Unclear response, ask for clarification
+            return f"I didn't understand your response '{user_input}'. Please respond with 'yes', 'no', or 'exit' to continue."
 
 
 def main():

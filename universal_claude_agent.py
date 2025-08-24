@@ -20,7 +20,7 @@ import shutil
 OLLAMA_API_BASE = "http://localhost:11434/api/generate"
 PROJECT_CONTEXT_FILE = "project_context.json"
 MAX_RETRIES = 3
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = 120  # Increased timeout for GGUF models
 
 class ULCAgent:
     """Universal Local Claude Agent - Main agent class"""
@@ -129,12 +129,14 @@ class ULCAgent:
             "options": {
                 "temperature": 0.1,
                 "top_p": 0.9,
-                "max_tokens": 4000
+                "num_predict": 2000,  # Use num_predict for Llama models
+                "stop": ["\n\nHuman:", "\n\nUser:", "Human:", "User:"]  # Stop tokens
             }
         }
         
         for attempt in range(MAX_RETRIES):
             try:
+                print(f"🔄 Attempting LLM call (attempt {attempt + 1}/{MAX_RETRIES})...")
                 response = requests.post(
                     OLLAMA_API_BASE, 
                     json=payload, 
@@ -144,10 +146,23 @@ class ULCAgent:
                 
                 result = response.json()
                 if "response" in result:
-                    return result["response"]
+                    return result["response"].strip()
                 else:
+                    print(f"⚠️  Unexpected response format: {result}")
                     return "Error: Unexpected response format from LLM"
                     
+            except requests.exceptions.Timeout:
+                if attempt < MAX_RETRIES - 1:
+                    print(f"⏰ Timeout on attempt {attempt + 1}/{MAX_RETRIES}. Retrying...")
+                    time.sleep(5)  # Wait 5 seconds before retry
+                else:
+                    return f"Error: LLM request timed out after {MAX_RETRIES} attempts. The model might be busy or too slow."
+            except requests.exceptions.ConnectionError:
+                if attempt < MAX_RETRIES - 1:
+                    print(f"🔌 Connection error on attempt {attempt + 1}/{MAX_RETRIES}. Retrying...")
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    return f"Error: Failed to connect to LLM after {MAX_RETRIES} attempts. Check if Ollama is running."
             except requests.exceptions.RequestException as e:
                 if attempt < MAX_RETRIES - 1:
                     print(f"⚠️  API call failed (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
@@ -395,6 +410,14 @@ FORMAT YOUR RESPONSE CLEARLY AND STRUCTURED. Always end with a clear question or
                     self._show_files()
                     continue
                 
+                if user_input.lower() == 'test':
+                    self._test_llm_connection()
+                    continue
+                
+                if user_input.lower() == 'ls':
+                    self._show_files()
+                    continue
+                
                 # Process user input
                 response = self.process_user_input(user_input)
                 
@@ -417,6 +440,7 @@ FORMAT YOUR RESPONSE CLEARLY AND STRUCTURED. Always end with a clear question or
 - status: Show current project status
 - todo: Show current TODO list
 - files: Show current directory contents
+- test: Test LLM connection
 - exit/quit/q: Exit the program
 
 💡 Usage Tips:
@@ -454,6 +478,21 @@ FORMAT YOUR RESPONSE CLEARLY AND STRUCTURED. Always end with a clear question or
         """Show current directory contents"""
         print("📁 Current Directory Contents:")
         print(self._get_file_listing())
+    
+    def _test_llm_connection(self):
+        """Test LLM connection with a simple prompt"""
+        print("🧪 Testing LLM connection...")
+        test_prompt = "Please respond with 'Connection test successful!' and nothing else."
+        
+        try:
+            response = self._call_llm(test_prompt)
+            if response.startswith("Error:"):
+                print(f"❌ {response}")
+            else:
+                print(f"✅ LLM connection successful!")
+                print(f"🤖 Response: {response}")
+        except Exception as e:
+            print(f"❌ Test failed with error: {e}")
 
 
 def main():
